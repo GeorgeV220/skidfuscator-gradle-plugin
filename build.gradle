@@ -38,16 +38,16 @@ repositories {
 }
 
 dependencies {
-    compileOnly 'org.projectlombok:lombok:1.18.24'
-    annotationProcessor 'org.projectlombok:lombok:1.18.24'
+    compileOnly 'org.projectlombok:lombok:1.18.46'
+    annotationProcessor 'org.projectlombok:lombok:1.18.46'
 
     implementation 'com.typesafe:config:1.4.3'
 
     compileOnly gradleApi()
-    compileOnly 'org.codehaus.groovy:groovy-all:3.0.9'
+    compileOnly 'org.apache.groovy:groovy-all:5.0.8'
 
     api 'com.github.skidfuscatordev.skidfuscator-java-obfuscator:depend-analysis:2d818f09fd'
-    implementation 'commons-io:commons-io:2.11.0'
+    implementation 'commons-io:commons-io:2.22.0'
 }
 
 publishing {
