@@ -10,9 +10,14 @@ import org.gradle.api.NamedDomainObjectContainer;
 import org.gradle.api.Plugin;
 import org.gradle.api.Project;
 import org.gradle.api.Task;
+import org.gradle.api.file.ArchiveOperations;
+import org.gradle.api.file.FileSystemOperations;
+import org.gradle.api.model.ObjectFactory;
+import org.gradle.process.ExecOperations;
 import org.gradle.jvm.tasks.Jar;
 import org.jetbrains.annotations.NotNull;
 
+import javax.inject.Inject;
 import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -20,7 +25,10 @@ import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Collectors;
 
-public class SkidfuscatorPlugin implements Plugin<Project> {
+public abstract class SkidfuscatorPlugin implements Plugin<Project> {
+    @Inject
+    protected abstract ExecOperations getExecOperations();
+
     @Override
     public void apply(@NotNull Project project) {
         this.addExclude(project);
@@ -202,12 +210,13 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
                 args.add(outputJar.getAbsolutePath());
 
                 project.getLogger().lifecycle("Running Skidfuscator...");
-                project.exec(spec -> {
+                List<String> fullArgs = new ArrayList<>();
+                fullArgs.add("-jar");
+                fullArgs.add(skidJar.getAbsolutePath());
+                fullArgs.addAll(args);
+
+                getExecOperations().exec(spec -> {
                     spec.setExecutable("java");
-                    List<String> fullArgs = new ArrayList<>();
-                    fullArgs.add("-jar");
-                    fullArgs.add(skidJar.getAbsolutePath());
-                    fullArgs.addAll(args);
                     spec.setArgs(fullArgs);
                     spec.setIgnoreExitValue(false);
                 });
