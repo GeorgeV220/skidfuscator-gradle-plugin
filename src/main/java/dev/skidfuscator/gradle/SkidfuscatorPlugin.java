@@ -3,344 +3,794 @@ package dev.skidfuscator.gradle;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 import com.typesafe.config.ConfigRenderOptions;
-import com.typesafe.config.ConfigValueFactory;
-import dev.skidfuscator.dependanalysis.DependencyAnalyzer;
-import dev.skidfuscator.dependanalysis.DependencyResult;
+import org.gradle.api.GradleException;
 import org.gradle.api.NamedDomainObjectContainer;
 import org.gradle.api.Plugin;
 import org.gradle.api.Project;
 import org.gradle.api.Task;
-import org.gradle.api.file.ArchiveOperations;
-import org.gradle.api.file.FileSystemOperations;
-import org.gradle.api.model.ObjectFactory;
+import org.gradle.api.artifacts.ResolvedArtifact;
+import org.gradle.api.tasks.TaskProvider;
 import org.gradle.process.ExecOperations;
-import org.gradle.jvm.tasks.Jar;
 import org.jetbrains.annotations.NotNull;
+import org.jspecify.annotations.NonNull;
 
 import javax.inject.Inject;
-import java.io.*;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.nio.file.Path;
-import java.util.*;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 public abstract class SkidfuscatorPlugin implements Plugin<Project> {
+
     @Inject
     protected abstract ExecOperations getExecOperations();
 
     @Override
     public void apply(@NotNull Project project) {
-        this.addExclude(project);
+        addExclude(project);
 
         NamedDomainObjectContainer<TransformerSpec> transformerContainer =
-                project.getObjects().domainObjectContainer(TransformerSpec.class, name -> new TransformerSpec(name));
+                project.getObjects().domainObjectContainer(
+                        TransformerSpec.class,
+                        TransformerSpec::new
+                );
 
-        SkidfuscatorExtension extension = project.getExtensions().create("skidfuscator", SkidfuscatorExtension.class, transformerContainer);
+        SkidfuscatorExtension extension = project.getExtensions().create(
+                "skidfuscator",
+                SkidfuscatorExtension.class,
+                transformerContainer
+        );
 
-        project.afterEvaluate(p -> {
-            Task jarTask = p.getTasks().findByName("jar");
-            Task shadowJarTask = p.getTasks().findByName("shadowJar");
-            Task finalTask = (shadowJarTask != null) ? shadowJarTask : jarTask;
-
-            if (finalTask == null) {
-                project.getLogger().lifecycle("No jar or shadowJar task found. Skidfuscator will not run automatically.");
-                return;
-            }
-
-            // Add new task to collect dependencies
-            Task collectDependencies = p.getTasks().create("collectSkidfuscatorDependencies", task -> {
-                task.doLast(t -> {
-                    File depsDir = new File(p.getBuildDir(), "skidfuscator/dependencies");
-                    if (!depsDir.exists()) {
-                        depsDir.mkdirs();
-                    }
-
-                    // Clear existing files
-                    Arrays.stream(depsDir.listFiles()).forEach(File::delete);
-
-                    // Collect all runtime dependencies
-                    Set<File> deps = p.getConfigurations().getByName("compileClasspath")
-                            .getResolvedConfiguration()
-                            .getResolvedArtifacts()
-                            .stream()
-                            .map(artifact -> artifact.getFile())
-                            .collect(Collectors.toSet());
-
-                    // Log the initial list of dependencies
-                    project.getLogger().lifecycle("Initial dependencies collected (" + deps.size() + "):");
-                    deps.forEach(dep -> project.getLogger().lifecycle(" - " + dep.getAbsolutePath()));
-
-                    // Copy dependencies to the deps directory
-                    for (File dep : deps) {
-                        try {
-                            File destFile = new File(depsDir, dep.getName());
-                            java.nio.file.Files.copy(
-                                dep.toPath(),
-                                destFile.toPath(),
-                                java.nio.file.StandardCopyOption.REPLACE_EXISTING
-                            );
-                        } catch (IOException e) {
-                            project.getLogger().warn("Failed to copy dependency: " + dep.getName(), e);
-                        }
-                    }
-                });
-            });
-
-            finalTask.doLast(task -> {
-                // Run the collect dependencies task first
-                collectDependencies.getActions().forEach(action -> action.execute(task));
-
-                File skidDir = new File(p.getBuildDir(), "skidfuscator");
-                if (!skidDir.exists()) {
-                    skidDir.mkdirs();
-                }
-
-                String resolvedVersion;
-                try {
-                    resolvedVersion = resolveVersion(extension.getSkidfuscatorVersion());
-                } catch (IOException e) {
-                    project.getLogger().error("Failed to fetch latest Skidfuscator version: " + e.getMessage());
-                    return;
-                }
-
-                File versionFile = new File(skidDir, ".version");
-                String currentVersion = readVersionFile(versionFile);
-
-                File skidJar = new File(p.getProjectDir(), ".skidfuscator/skidfuscator-" + resolvedVersion + ".jar");
-                if (!skidJar.getParentFile().exists()) {
-                    skidJar.getParentFile().mkdirs();
-                }
-                // If version changed or jar not present, re-download
-                if (!"dev".equalsIgnoreCase(resolvedVersion) && resolvedVersion.equals(currentVersion) || !skidJar.exists()) {
-                    project.getLogger().warn("Could not find Skidfuscator jar at " + skidJar.getAbsolutePath() + ", downloading...");
-                    project.getLogger().lifecycle("Downloading Skidfuscator " + resolvedVersion + "...");
-                    try {
-                        downloadSkidfuscatorJar(resolvedVersion, skidJar);
-                        writeVersionFile(versionFile, resolvedVersion);
-                    } catch (IOException e) {
-                        project.getLogger().error("Failed to download Skidfuscator: " + e.getMessage(), e);
-                        return;
-                    }
-                }
-
-                File outputJar;
-                if (shadowJarTask != null) {
-                    outputJar = new File(p.getBuildDir(), "libs/" + p.getName() + "-" + p.getVersion() + "-all.jar");
-                } else {
-                    outputJar = new File(p.getBuildDir(), "libs/" + p.getName() + "-" + p.getVersion() + ".jar");
-                }
-
-                if (!outputJar.exists()) {
-                    project.getLogger().lifecycle("Output jar not found at " + outputJar.getAbsolutePath() + ", cannot run Skidfuscator.");
-                    return;
-                }
-
-                // Add the dependencies directory as the single libs folder
-                File depsDir = new File(p.getBuildDir(), "skidfuscator/dependencies");
-                if (depsDir.exists() && depsDir.listFiles().length > 0) {
-                    final List<String> reduced = new ArrayList<>();
-                    final DependencyAnalyzer analyzer = new DependencyAnalyzer(
-                            outputJar.toPath(),
-                            depsDir.toPath()
+        TaskProvider<Task> collectDependencies = project.getTasks().register(
+                "collectSkidfuscatorDependencies",
+                task -> {
+                    task.setGroup("skidfuscator");
+                    task.setDescription(
+                            "Collects dependencies required by Skidfuscator."
                     );
 
-                    try {
-                        final DependencyResult result = analyzer.analyze();
-                        for(DependencyResult.JarDependency jarDependency : result.getJarDependencies()) {
-                            project.getLogger().lifecycle("JAR: " + jarDependency.getJarPath().getFileName());
-                            project.getLogger().lifecycle("---------------------------------------------------");
-
-                            for(DependencyResult.ClassDependency classDep : jarDependency.getClassesNeeded()) {
-                                project.getLogger().lifecycle("  Class: " + classDep.getClassName());
-
-                                for(String reason : classDep.getReasons()) {
-                                    project.getLogger().lifecycle("    - " + reason);
-                                }
-                            }
-
-                            project.getLogger().lifecycle("");
-                        }
-                        project.getLogger().lifecycle("Reducing dependencies...");
-                        reduced.addAll(result.getJarDependencies().stream()
-                                .map(DependencyResult.JarDependency::getJarPath)
-                                .map(Path::toString)
-                                .collect(Collectors.toList()));
-                        project.getLogger().lifecycle("Reduced dependencies (" + reduced.size() + "):");
-                    } catch (IOException e) {
-                        project.getLogger().error("Failed to minimize analyzed dependencies: " + e.getMessage(), e);
-                        return;
-                    }
-
-                    extension.getLibs().addAll(reduced);
+                    task.doLast(t -> collectDependencies(project));
                 }
+        );
 
-                File configFile = new File(skidDir, extension.getConfigFileName());
-                try {
-                    writeHoconConfig(extension, configFile);
-                } catch (IOException e) {
-                    project.getLogger().error("Failed to write config file: " + e.getMessage(), e);
-                    return;
+        project.getTasks().register(
+                "skidfuscate",
+                task -> {
+                    task.setGroup("skidfuscator");
+                    task.setDescription(
+                            "Obfuscates the configured input JAR using Skidfuscator."
+                    );
+
+                    task.dependsOn(collectDependencies);
+
+                    task.doLast(t ->
+                            runSkidfuscator(project, extension)
+                    );
                 }
-
-                File resultJar = (extension.getOutput() != null)
-                        ? new File(extension.getOutput())
-                        : new File(outputJar.getParentFile(), outputJar.getName().replace(".jar", "-obf.jar"));
-
-                List<String> args = new ArrayList<>();
-                args.add("obfuscate");
-                args.add("-cfg"); args.add(configFile.getAbsolutePath());
-                args.add("-o"); args.add(resultJar.getAbsolutePath());
-                args.add("--debug");
-
-                if (extension.isPhantom()) args.add("-ph");
-                if (extension.isFuckit()) args.add("-fuckit");
-                if (extension.isDebug()) args.add("-dbg");
-                if (extension.isNotrack()) args.add("-notrack");
-
-                if (extension.getRuntime() != null) {
-                    File rt = new File(extension.getRuntime());
-                    if (rt.exists()) {
-                        args.add("-rt");
-                        args.add(rt.getAbsolutePath());
-                    }
-                }
-
-                // Input jar last
-                args.add(outputJar.getAbsolutePath());
-
-                project.getLogger().lifecycle("Running Skidfuscator...");
-                List<String> fullArgs = new ArrayList<>();
-                fullArgs.add("-jar");
-                fullArgs.add(skidJar.getAbsolutePath());
-                fullArgs.addAll(args);
-
-                getExecOperations().exec(spec -> {
-                    spec.setExecutable("java");
-                    spec.setArgs(fullArgs);
-                    spec.setIgnoreExitValue(false);
-                });
-
-                project.getLogger().lifecycle("Skidfuscation complete! Obfuscated jar at " + resultJar.getAbsolutePath());
-            });
-        });
+        );
     }
 
-    private String resolveVersion(String requestedVersion) throws IOException {
-        if (!"latest".equalsIgnoreCase(requestedVersion)) {
+    private void collectDependencies(@NonNull Project project) {
+        File depsDir = new File(
+                project.getLayout()
+                        .getBuildDirectory()
+                        .get()
+                        .getAsFile(),
+                "skidfuscator/dependencies"
+        );
+
+        if (!depsDir.exists() && !depsDir.mkdirs()) {
+            throw new GradleException(
+                    "Failed to create Skidfuscator dependencies directory: "
+                            + depsDir.getAbsolutePath()
+            );
+        }
+
+        File[] existingFiles = depsDir.listFiles();
+
+        if (existingFiles != null) {
+            for (File file : existingFiles) {
+                try {
+                    Files.deleteIfExists(file.toPath());
+                } catch (IOException e) {
+                    throw new GradleException(
+                            "Failed to delete old Skidfuscator dependency: "
+                                    + file.getAbsolutePath(),
+                            e
+                    );
+                }
+            }
+        }
+
+        Set<File> dependencies = project
+                .getConfigurations()
+                .getByName("compileClasspath")
+                .getResolvedConfiguration()
+                .getResolvedArtifacts()
+                .stream()
+                .map(ResolvedArtifact::getFile)
+                .collect(Collectors.toSet());
+
+        project.getLogger().lifecycle(
+                "Collecting {} dependencies for Skidfuscator...",
+                dependencies.size()
+        );
+
+        for (File dependency : dependencies) {
+            File destination = new File(
+                    depsDir,
+                    dependency.getName()
+            );
+
+            project.getLogger().info(
+                    "Skidfuscator dependency: {}",
+                    dependency.getAbsolutePath()
+            );
+
+            try {
+                Files.copy(
+                        dependency.toPath(),
+                        destination.toPath(),
+                        StandardCopyOption.REPLACE_EXISTING
+                );
+            } catch (IOException e) {
+                throw new GradleException(
+                        "Failed to copy dependency: "
+                                + dependency.getAbsolutePath(),
+                        e
+                );
+            }
+        }
+
+        project.getLogger().lifecycle(
+                "Collected {} dependencies for Skidfuscator.",
+                dependencies.size()
+        );
+    }
+
+    private void runSkidfuscator(
+            Project project,
+            @NonNull SkidfuscatorExtension extension
+    ) {
+        String configuredInput = extension.getInput();
+
+        if (configuredInput == null
+                || configuredInput.trim().isEmpty()) {
+            throw new GradleException(
+                    "Skidfuscator input JAR is not configured. "
+                            + "Set skidfuscator.input in your build script."
+            );
+        }
+
+        File inputJar = project.file(configuredInput);
+
+        if (!inputJar.exists()) {
+            throw new GradleException(
+                    "Skidfuscator input JAR does not exist: "
+                            + inputJar.getAbsolutePath()
+            );
+        }
+
+        if (!inputJar.isFile()) {
+            throw new GradleException(
+                    "Skidfuscator input is not a file: "
+                            + inputJar.getAbsolutePath()
+            );
+        }
+
+        File skidDir = new File(
+                project.getLayout()
+                        .getBuildDirectory()
+                        .get()
+                        .getAsFile(),
+                "skidfuscator"
+        );
+
+        if (!skidDir.exists() && !skidDir.mkdirs()) {
+            throw new GradleException(
+                    "Failed to create Skidfuscator directory: "
+                            + skidDir.getAbsolutePath()
+            );
+        }
+
+        String resolvedVersion;
+
+        try {
+            resolvedVersion = resolveVersion(
+                    extension.getSkidfuscatorVersion()
+            );
+        } catch (IOException e) {
+            throw new GradleException(
+                    "Failed to resolve Skidfuscator version",
+                    e
+            );
+        }
+
+        File versionFile = new File(
+                skidDir,
+                ".version"
+        );
+
+        String currentVersion =
+                readVersionFile(versionFile);
+
+        File skidJar = new File(
+                project.getProjectDir(),
+                ".skidfuscator/skidfuscator-"
+                        + resolvedVersion
+                        + ".jar"
+        );
+
+        File skidJarDirectory =
+                skidJar.getParentFile();
+
+        if (!skidJarDirectory.exists()
+                && !skidJarDirectory.mkdirs()) {
+            throw new GradleException(
+                    "Failed to create Skidfuscator directory: "
+                            + skidJarDirectory.getAbsolutePath()
+            );
+        }
+
+        boolean shouldDownload =
+                !skidJar.exists();
+
+        if (!"dev".equalsIgnoreCase(resolvedVersion)
+                && !resolvedVersion.equals(currentVersion)) {
+            shouldDownload = true;
+        }
+
+        if (shouldDownload) {
+            project.getLogger().lifecycle(
+                    "Downloading Skidfuscator {}...",
+                    resolvedVersion
+            );
+
+            try {
+                downloadSkidfuscatorJar(
+                        resolvedVersion,
+                        skidJar
+                );
+
+                writeVersionFile(
+                        versionFile,
+                        resolvedVersion
+                );
+            } catch (IOException e) {
+                throw new GradleException(
+                        "Failed to download Skidfuscator "
+                                + resolvedVersion,
+                        e
+                );
+            }
+        }
+
+        File depsDir = new File(
+                skidDir,
+                "dependencies"
+        );
+
+        if (depsDir.exists()) {
+            File[] dependencyJars = depsDir.listFiles(
+                    file ->
+                            file.isFile()
+                                    && file.getName()
+                                    .endsWith(".jar")
+            );
+
+            if (dependencyJars != null) {
+                Arrays.sort(
+                        dependencyJars,
+                        (a, b) ->
+                                a.getName()
+                                        .compareToIgnoreCase(
+                                                b.getName()
+                                        )
+                );
+
+                project.getLogger().lifecycle(
+                        "Adding {} libraries to Skidfuscator...",
+                        dependencyJars.length
+                );
+
+                for (File dependencyJar :
+                        dependencyJars) {
+
+                    String path =
+                            dependencyJar.getAbsolutePath();
+
+                    project.getLogger().info(
+                            "Skidfuscator library: {}",
+                            dependencyJar.getName()
+                    );
+
+                    if (!extension.getLibs()
+                            .contains(path)) {
+                        extension.getLibs()
+                                .add(path);
+                    }
+                }
+            }
+        }
+
+        File configFile = new File(
+                skidDir,
+                extension.getConfigFileName()
+        );
+
+        try {
+            writeHoconConfig(
+                    extension,
+                    configFile
+            );
+        } catch (IOException e) {
+            throw new GradleException(
+                    "Failed to generate Skidfuscator config: "
+                            + configFile.getAbsolutePath(),
+                    e
+            );
+        }
+
+        File resultJar;
+
+        if (extension.getOutput() != null
+                && !extension.getOutput()
+                .trim()
+                .isEmpty()) {
+
+            resultJar =
+                    project.file(
+                            extension.getOutput()
+                    );
+        } else {
+            String name =
+                    inputJar.getName();
+
+            if (name.endsWith(".jar")) {
+                name = name.substring(
+                        0,
+                        name.length() - 4
+                ) + "-obfuscated.jar";
+            } else {
+                name += "-obfuscated.jar";
+            }
+
+            resultJar = new File(
+                    inputJar.getParentFile(),
+                    name
+            );
+        }
+
+        File resultDirectory =
+                resultJar.getParentFile();
+
+        if (resultDirectory != null
+                && !resultDirectory.exists()
+                && !resultDirectory.mkdirs()) {
+            throw new GradleException(
+                    "Failed to create output directory: "
+                            + resultDirectory.getAbsolutePath()
+            );
+        }
+
+        List<String> args =
+                new ArrayList<>();
+
+        args.add("obfuscate");
+
+        args.add("-cfg");
+        args.add(
+                configFile.getAbsolutePath()
+        );
+
+        args.add("-o");
+        args.add(
+                resultJar.getAbsolutePath()
+        );
+
+        if (extension.isPhantom()) {
+            args.add("-ph");
+        }
+
+        if (extension.isFuckit()) {
+            args.add("-fuckit");
+        }
+
+        if (extension.isDebug()) {
+            args.add("--debug");
+        }
+
+        if (extension.isNotrack()) {
+            args.add("-notrack");
+        }
+
+        if (extension.getRuntime() != null
+                && !extension.getRuntime()
+                .trim()
+                .isEmpty()) {
+
+            File runtime =
+                    project.file(
+                            extension.getRuntime()
+                    );
+
+            if (runtime.exists()) {
+                args.add("-rt");
+                args.add(
+                        runtime.getAbsolutePath()
+                );
+            } else {
+                project.getLogger().warn(
+                        "Configured Skidfuscator runtime does not exist: {}",
+                        runtime.getAbsolutePath()
+                );
+            }
+        }
+
+        args.add(
+                inputJar.getAbsolutePath()
+        );
+
+        List<String> fullArgs =
+                new ArrayList<>();
+
+        fullArgs.add("-jar");
+        fullArgs.add(
+                skidJar.getAbsolutePath()
+        );
+
+        fullArgs.addAll(args);
+
+        project.getLogger().lifecycle(
+                "Running Skidfuscator {}",
+                resolvedVersion
+        );
+
+        project.getLogger().lifecycle(
+                "Input : {}",
+                inputJar.getAbsolutePath()
+        );
+
+        project.getLogger().lifecycle(
+                "Output: {}",
+                resultJar.getAbsolutePath()
+        );
+
+        File javaExecutable = new File(
+                System.getProperty("java.home"),
+                "bin/java"
+        );
+
+        getExecOperations().exec(spec -> {
+            spec.setExecutable(
+                    javaExecutable.getAbsolutePath()
+            );
+
+            spec.setArgs(fullArgs);
+
+            spec.setWorkingDir(
+                    skidDir
+            );
+
+            spec.setIgnoreExitValue(false);
+        });
+
+        if (!resultJar.exists()) {
+            throw new GradleException(
+                    "Skidfuscator completed without producing "
+                            + "the expected output JAR: "
+                            + resultJar.getAbsolutePath()
+            );
+        }
+
+        project.getLogger().lifecycle(
+                "Skidfuscation complete: {}",
+                resultJar.getAbsolutePath()
+        );
+    }
+
+    private String resolveVersion(
+            String requestedVersion
+    ) throws IOException {
+        if (!"latest".equalsIgnoreCase(
+                requestedVersion
+        )) {
             return requestedVersion;
         }
 
-        URL url = new URL("https://api.github.com/repos/skidfuscatordev/skidfuscator-java-obfuscator/releases/latest");
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setRequestProperty("Accept", "application/vnd.github.v3+json");
-        conn.connect();
-        if (conn.getResponseCode() != 200) {
-            throw new IOException("Failed to fetch latest release info. HTTP " + conn.getResponseCode());
-        }
-        try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
-            String json = br.lines().collect(Collectors.joining());
-            int tagIndex = json.indexOf("\"tag_name\"");
-            if (tagIndex == -1) {
-                throw new IOException("Could not find tag_name in release JSON");
-            }
-            int start = json.indexOf(":", tagIndex) + 1;
-            int end = json.indexOf(",", start);
-            if (end == -1) end = json.indexOf("}", start);
-            String tag = json.substring(start, end).replaceAll("\"", "").trim();
-            return tag.startsWith("v") ? tag.substring(1) : tag;
-        }
-    }
-
-    private void downloadSkidfuscatorJar(String version, File target) throws IOException {
-        String urlStr = "https://github.com/skidfuscatordev/skidfuscator-java-obfuscator/releases/download/" + version + "/skidfuscator.jar";
-        URL url = new URL(urlStr);
-        try (InputStream in = url.openStream(); OutputStream out = new FileOutputStream(target)) {
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = in.read(buffer)) != -1) {
-                out.write(buffer, 0, read);
-            }
-        }
-    }
-
-    private void writeHoconConfig(SkidfuscatorExtension ext, File configFile) throws IOException {
-        Config config = buildConfig(ext);
-        String rendered = config.root().render(
-            ConfigRenderOptions.defaults()
-                .setComments(false)
-                .setJson(false)
-                .setOriginComments(false)
+        URL url = new URL(
+                "https://api.github.com/repos/"
+                        + "skidfuscatordev/"
+                        + "skidfuscator-java-obfuscator/"
+                        + "releases/latest"
         );
 
-        try (FileWriter fw = new FileWriter(configFile)) {
-            fw.write(rendered);
+        HttpURLConnection connection =
+                (HttpURLConnection)
+                        url.openConnection();
+
+        connection.setRequestProperty(
+                "Accept",
+                "application/vnd.github.v3+json"
+        );
+
+        connection.connect();
+
+        if (connection.getResponseCode()
+                != HttpURLConnection.HTTP_OK) {
+            throw new IOException(
+                    "Failed to fetch latest Skidfuscator release. HTTP "
+                            + connection.getResponseCode()
+            );
+        }
+
+        try (BufferedReader reader =
+                     new BufferedReader(
+                             new InputStreamReader(
+                                     connection.getInputStream()
+                             )
+                     )) {
+
+            String json = reader
+                    .lines()
+                    .collect(
+                            Collectors.joining()
+                    );
+
+            int tagIndex =
+                    json.indexOf("\"tag_name\"");
+
+            if (tagIndex == -1) {
+                throw new IOException(
+                        "Could not find tag_name in GitHub response"
+                );
+            }
+
+            int start =
+                    json.indexOf(
+                            ":",
+                            tagIndex
+                    ) + 1;
+
+            int end =
+                    json.indexOf(
+                            ",",
+                            start
+                    );
+
+            if (end == -1) {
+                end = json.indexOf(
+                        "}",
+                        start
+                );
+            }
+
+            String tag = json
+                    .substring(start, end)
+                    .replace("\"", "")
+                    .trim();
+
+            return tag.startsWith("v")
+                    ? tag.substring(1)
+                    : tag;
+        } finally {
+            connection.disconnect();
         }
     }
 
-    private Config buildConfig(SkidfuscatorExtension ext) {
-        Map<String, Object> rootMap = new HashMap<>();
-        rootMap.put("exempt", ext.getExempt());
-        rootMap.put("libraries", ext.getLibs());
+    private void downloadSkidfuscatorJar(
+            String version,
+            File target
+    ) throws IOException {
+        String urlString =
+                "https://github.com/"
+                        + "skidfuscatordev/"
+                        + "skidfuscator-java-obfuscator/"
+                        + "releases/download/"
+                        + version
+                        + "/skidfuscator.jar";
 
-        // Dynamically add transformers
-        Map<String, Object> transformerMap = new HashMap<>();
-        ext.getTransformers().getTransformers().forEach(spec -> {
-            transformerMap.put(spec.getName(), spec.getProperties());
-        });
+        URL url =
+                new URL(urlString);
 
-        // Merge transformer configs at root
-        rootMap.putAll(transformerMap);
+        try (
+                InputStream input =
+                        url.openStream();
 
-        // Parse the map into a Config
-        return ConfigFactory.parseMap(rootMap);
+                OutputStream output =
+                        new FileOutputStream(target)
+        ) {
+            byte[] buffer =
+                    new byte[8192];
+
+            int read;
+
+            while ((read =
+                    input.read(buffer))
+                    != -1) {
+
+                output.write(
+                        buffer,
+                        0,
+                        read
+                );
+            }
+        }
     }
 
-    private String readVersionFile(File versionFile) {
-        if (!versionFile.exists()) return "";
-        try (BufferedReader br = new BufferedReader(new FileReader(versionFile))) {
-            return br.readLine().trim();
-        } catch (IOException e) {
+    private void writeHoconConfig(
+            SkidfuscatorExtension extension,
+            File configFile
+    ) throws IOException {
+        Config config =
+                buildConfig(extension);
+
+        String rendered =
+                config.root().render(
+                        ConfigRenderOptions
+                                .defaults()
+                                .setComments(false)
+                                .setJson(false)
+                                .setOriginComments(false)
+                );
+
+        try (FileWriter writer =
+                     new FileWriter(configFile)) {
+            writer.write(rendered);
+        }
+    }
+
+    private Config buildConfig(
+            SkidfuscatorExtension extension
+    ) {
+        Map<String, Object> root =
+                new HashMap<>();
+
+        root.put(
+                "exempt",
+                extension.getExempt()
+        );
+
+        root.put(
+                "libraries",
+                extension.getLibs()
+        );
+
+        extension.getTransformers()
+                .getTransformers()
+                .forEach(transformer ->
+                        root.put(
+                                transformer.getName(),
+                                transformer.getProperties()
+                        )
+                );
+
+        return ConfigFactory.parseMap(root);
+    }
+
+    private String readVersionFile(
+            File versionFile
+    ) {
+        if (!versionFile.exists()) {
+            return "";
+        }
+
+        try (BufferedReader reader =
+                     new BufferedReader(
+                             new FileReader(versionFile)
+                     )) {
+
+            String line =
+                    reader.readLine();
+
+            return line != null
+                    ? line.trim()
+                    : "";
+        } catch (IOException ignored) {
             return "";
         }
     }
 
-    private void writeVersionFile(File versionFile, String version) {
-        try (FileWriter fw = new FileWriter(versionFile)) {
-            fw.write(version);
-        } catch (IOException ignored) {}
+    private void writeVersionFile(
+            File versionFile,
+            String version
+    ) throws IOException {
+        try (FileWriter writer =
+                     new FileWriter(versionFile)) {
+            writer.write(version);
+        }
     }
 
-    private void addExclude(final Project project) {
-        // Add gitignore handling at plugin application time
-        File gitignore = new File(project.getRootDir(), ".gitignore");
+    private void addExclude(
+            Project project
+    ) {
+        File gitignore =
+                new File(
+                        project.getRootDir(),
+                        ".gitignore"
+                );
+
         try {
-            // Check if .skidfuscator is already in .gitignore
             boolean needsEntry = true;
+
             if (gitignore.exists()) {
-                try (BufferedReader reader = new BufferedReader(new FileReader(gitignore))) {
-                    if (reader.lines().anyMatch(line -> line.trim().equals(".skidfuscator"))) {
-                        needsEntry = false;
-                    }
+                try (BufferedReader reader =
+                             new BufferedReader(
+                                     new FileReader(gitignore)
+                             )) {
+
+                    needsEntry =
+                            reader.lines()
+                                    .noneMatch(
+                                            line ->
+                                                    line.trim()
+                                                            .equals(
+                                                                    ".skidfuscator"
+                                                            )
+                                    );
                 }
             }
 
-            // Append .skidfuscator to .gitignore if needed
-            if (needsEntry) {
-                try (FileWriter writer = new FileWriter(gitignore, true)) {
-                    // Add newline if file exists and doesn't end with one
-                    if (gitignore.exists() && gitignore.length() > 0) {
-                        String content = new String(java.nio.file.Files.readAllBytes(gitignore.toPath()));
-                        if (!content.endsWith("\n")) {
-                            writer.write("\n");
-                        }
-                    }
-                    writer.write(".skidfuscator\n");
-                }
-                project.getLogger().lifecycle("Added .skidfuscator to .gitignore");
+            if (!needsEntry) {
+                return;
             }
+
+            boolean needsNewline =
+                    gitignore.exists()
+                            && gitignore.length() > 0;
+
+            if (needsNewline) {
+                byte[] content =
+                        Files.readAllBytes(
+                                gitignore.toPath()
+                        );
+
+                needsNewline =
+                        content.length > 0
+                                && content[
+                                content.length - 1
+                                ] != '\n';
+            }
+
+            try (FileWriter writer =
+                         new FileWriter(
+                                 gitignore,
+                                 true
+                         )) {
+
+                if (needsNewline) {
+                    writer.write("\n");
+                }
+
+                writer.write(
+                        ".skidfuscator\n"
+                );
+            }
+
+            project.getLogger().lifecycle(
+                    "Added .skidfuscator to .gitignore"
+            );
         } catch (IOException e) {
-            project.getLogger().warn("Failed to update .gitignore: " + e.getMessage());
+            project.getLogger().warn(
+                    "Failed to update .gitignore: {}",
+                    e.getMessage()
+            );
         }
     }
 }

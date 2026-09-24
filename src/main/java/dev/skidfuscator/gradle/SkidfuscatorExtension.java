@@ -21,6 +21,7 @@ public class SkidfuscatorExtension {
     private boolean debug = false;
     private boolean notrack = false;
     private String runtime = null;
+    private String input = null;
     private String output = null;
     private String configFileName = "skidfuscator.conf";
     private String skidfuscatorVersion = "latest";
