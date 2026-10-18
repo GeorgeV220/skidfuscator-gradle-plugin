@@ -1,12 +1,14 @@
 pluginManagement {
     repositories {
-        maven("https://repo.maven.apache.org/maven2/")
+        maven {
+            url = uri("https://repo.maven.apache.org/maven2/")
+        }
         gradlePluginPortal()
     }
 }
 
 plugins {
-    id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
 }
 
 rootProject.name = 'skidfuscator-gradle-plugin'
